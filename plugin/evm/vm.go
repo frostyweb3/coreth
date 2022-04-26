@@ -38,7 +38,6 @@ import (
 	// We must import this package (not referenced elsewhere) so that the native "callTracer"
 	// is added to a map of client-accessible tracers. In geth, this is done
 	// inside of cmd/geth.
-	_ "github.com/ava-labs/coreth/eth/tracers/js"
 	_ "github.com/ava-labs/coreth/eth/tracers/native"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -68,6 +67,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/perms"
 	"github.com/ava-labs/avalanchego/utils/profiler"
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
+	"github.com/ava-labs/avalanchego/utils/units"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
 	"github.com/ava-labs/avalanchego/vms/components/chain"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
@@ -110,6 +110,8 @@ const (
 	decidedCacheSize    = 100
 	missingCacheSize    = 50
 	unverifiedCacheSize = 50
+
+	targetAtomicTxsSize = 40 * units.KiB
 )
 
 // Define the API endpoints for the VM
@@ -237,6 +239,7 @@ type VM struct {
 	multiGatherer avalanchegoMetrics.MultiGatherer
 
 	bootstrapped bool
+	IsPlugin     bool
 }
 
 // Codec implements the secp256k1fx interface
@@ -251,14 +254,45 @@ func (vm *VM) Clock() *mockable.Clock { return &vm.clock }
 // Logger implements the secp256k1fx interface
 func (vm *VM) Logger() logging.Logger { return vm.ctx.Log }
 
-// setLogLevel sets the log level with the original [os.StdErr] interface along
-// with the context logger.
+// setLogLevel initializes logger and sets the log level with the original [os.StdErr] interface
+// along with the context logger.
 func (vm *VM) setLogLevel(logLevel log.Lvl) {
-	format := log.TerminalFormat(false)
-	log.Root().SetHandler(log.LvlFilterHandler(logLevel, log.MultiHandler(
-		log.StreamHandler(originalStderr, format),
-		log.StreamHandler(vm.ctx.Log, format),
-	)))
+	prefix, err := vm.ctx.BCLookup.PrimaryAlias(vm.ctx.ChainID)
+	if err != nil {
+		prefix = vm.ctx.ChainID.String()
+	}
+	prefix = fmt.Sprintf("<%s Chain>", prefix)
+	format := CorethFormat(prefix, vm.IsPlugin)
+	if vm.IsPlugin {
+		log.Root().SetHandler(log.LvlFilterHandler(logLevel, log.StreamHandler(originalStderr, format)))
+	} else {
+		log.Root().SetHandler(log.LvlFilterHandler(logLevel, log.StreamHandler(vm.ctx.Log, format)))
+	}
+}
+
+func CorethFormat(prefix string, doCopy bool) log.Format {
+	return log.FormatFunc(func(r *log.Record) []byte {
+		location := fmt.Sprintf("%+v", r.Call)
+		newMsg := fmt.Sprintf("%s %s: %s", prefix, location, r.Msg)
+		var b []byte
+		if doCopy {
+			// need to deep copy since we're using a multihandler
+			// as a result it will alter R.msg twice.
+			newRecord := log.Record{
+				Time:     r.Time,
+				Lvl:      r.Lvl,
+				Msg:      newMsg,
+				Ctx:      r.Ctx,
+				Call:     r.Call,
+				KeyNames: r.KeyNames,
+			}
+			b = log.TerminalFormat(false).Format(&newRecord)
+			return b
+		}
+		r.Msg = newMsg
+		b = log.TerminalFormat(false).Format(r)
+		return b
+	})
 }
 
 /*
@@ -292,6 +326,15 @@ func (vm *VM) Initialize(
 	if err := vm.config.Validate(); err != nil {
 		return err
 	}
+
+	// Set log level
+	logLevel, err := log.LvlFromString(vm.config.LogLevel)
+	if err != nil {
+		return fmt.Errorf("failed to initialize logger due to: %w ", err)
+	}
+
+	vm.ctx = ctx
+	vm.setLogLevel(logLevel)
 	if b, err := json.Marshal(vm.config); err == nil {
 		log.Info("Initializing Coreth VM", "Version", Version, "Config", string(b))
 	} else {
@@ -307,7 +350,6 @@ func (vm *VM) Initialize(
 	metrics.EnabledExpensive = vm.config.MetricsExpensiveEnabled
 
 	vm.shutdownChan = make(chan struct{}, 1)
-	vm.ctx = ctx
 	baseDB := dbManager.Current().Database
 	// Use NewNested rather than New so that the structure of the database
 	// remains the same regardless of the provided baseDB type.
@@ -341,14 +383,6 @@ func (vm *VM) Initialize(
 	ethConfig := ethconfig.NewDefaultConfig()
 	ethConfig.Genesis = g
 	ethConfig.NetworkId = vm.chainID.Uint64()
-
-	// Set log level
-	logLevel, err := log.LvlFromString(vm.config.LogLevel)
-	if err != nil {
-		return fmt.Errorf("failed to initialize logger due to: %w ", err)
-	}
-
-	vm.setLogLevel(logLevel)
 
 	// Set minimum price for mining and default gas price oracle value to the min
 	// gas price to prevent so transactions and blocks all use the correct fees
@@ -608,11 +642,19 @@ func (vm *VM) postBatchOnFinalizeAndAssemble(header *types.Header, state *state.
 		batchContribution *big.Int = new(big.Int).Set(common.Big0)
 		batchGasUsed      *big.Int = new(big.Int).Set(common.Big0)
 		rules                      = vm.chainConfig.AvalancheRules(header.Number, new(big.Int).SetUint64(header.Time))
+		size              int
 	)
 
 	for {
 		tx, exists := vm.mempool.NextTx()
 		if !exists {
+			break
+		}
+
+		// Ensure that adding [tx] to the block will not exceed the block size soft limit.
+		txSize := len(tx.Bytes())
+		if size+txSize > targetAtomicTxsSize {
+			vm.mempool.CancelCurrentTx(tx.ID())
 			break
 		}
 
@@ -662,6 +704,7 @@ func (vm *VM) postBatchOnFinalizeAndAssemble(header *types.Header, state *state.
 		// Add the [txGasUsed] to the [batchGasUsed] when the [tx] has passed verification
 		batchGasUsed.Add(batchGasUsed, txGasUsed)
 		batchContribution.Add(batchContribution, txContribution)
+		size += txSize
 	}
 
 	// If there is a non-zero number of transactions, marshal them and return the byte slice
